@@ -1,8 +1,19 @@
 package io.vertx.starter.http;
 
+import com.amazonaws.auth.AWSCredentials;
+import com.amazonaws.auth.AWSStaticCredentialsProvider;
+import com.amazonaws.auth.BasicAWSCredentials;
+import com.amazonaws.regions.Regions;
+import com.amazonaws.services.codepipeline.model.AWSSessionCredentials;
+import com.amazonaws.services.s3.AmazonS3;
+import com.amazonaws.services.s3.AmazonS3ClientBuilder;
+import com.amazonaws.services.s3.model.CannedAccessControlList;
+import com.amazonaws.services.s3.model.ObjectMetadata;
+import com.amazonaws.services.s3.model.PutObjectRequest;
+import com.amazonaws.util.DateUtils;
 import com.github.rjeschke.txtmark.Processor;
-import com.sun.deploy.util.StringUtils;
 import io.vertx.core.*;
+import io.vertx.core.http.HttpMethod;
 import io.vertx.core.http.HttpServer;
 import io.vertx.core.http.HttpServerOptions;
 import io.vertx.core.json.JsonArray;
@@ -26,9 +37,15 @@ import io.vertx.ext.web.templ.freemarker.FreeMarkerTemplateEngine;
 import io.vertx.starter.database.DatabaseConstants;
 import io.vertx.starter.database.WikiDatabaseService;
 import io.vertx.starter.geolocation.DistanceCalculator;
+import org.apache.commons.io.IOUtils;
 import org.hsqldb.lib.StringUtil;
+import sun.misc.BASE64Decoder;
+import sun.util.calendar.BaseCalendar;
 
+import java.io.*;
+import java.time.Instant;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.Date;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
@@ -108,9 +125,30 @@ public class HttpServerVerticle extends AbstractVerticle implements DatabaseCons
     router.post().handler(BodyHandler.create());
     router.post("/save").handler(this::pageUpdateHandler);
     router.post("/wiki/create").handler(this::pageCreateHandler);
+
     router.post("/delete").handler(this::pageDeletionHandler);
 
     Router apiRouter = Router.router(vertx);
+    router.route().handler(CorsHandler.create("*")
+      .allowedMethod(io.vertx.core.http.HttpMethod.GET)
+      .allowedMethod(io.vertx.core.http.HttpMethod.POST)
+      .allowedMethod(io.vertx.core.http.HttpMethod.OPTIONS)
+      .allowedMethod(HttpMethod.DELETE)
+      .allowedMethod(HttpMethod.PUT)
+      .allowedMethod(HttpMethod.HEAD)
+      .allowedHeader("Content-Type")
+      .allowedHeader("Accept")
+      .allowedHeader("Accept-Language")
+      .allowedHeader("Authorization")
+      .allowedHeader("login")
+      .allowedHeader("password")
+      .allowedHeader("Access-Control-Request-Method")
+      .allowedHeader("Access-Control-Allow-Credentials")
+      .allowedHeader("Access-Control-Allow-Origin")
+      .allowedHeader("Access-Control-Allow-Headers")
+      .allowedHeader("Access-Control-Request-Headers")
+      .allowedHeader("Content-Type"));
+    router.route().handler(BodyHandler.create());
 
     JWTAuth jwtAuth = JWTAuth.create(vertx, new JWTAuthOptions()
       .setKeyStore(new KeyStoreOptions()
@@ -175,6 +213,7 @@ public class HttpServerVerticle extends AbstractVerticle implements DatabaseCons
     apiRouter.put("/wiki/:id").handler(this::apiUpdateWiki);
     apiRouter.delete("/wiki/:id").handler(this::apiDeleteWiki);
     apiRouter.get("/wiki/nearfour/:id").handler(this::apinearFourWiki);
+    apiRouter.post("/wiki/uploadimage").handler(this::uploadPicHandler);
     router.mountSubRouter("/api", apiRouter);
 
     httpServer.requestHandler(router)
@@ -189,6 +228,46 @@ public class HttpServerVerticle extends AbstractVerticle implements DatabaseCons
           promise.fail(ar.cause());
         }
       });
+  }
+
+  private void uploadPicHandler(RoutingContext context) {
+    try{
+      String bucketName ="s3-dragon";
+      AWSCredentials credentials = new BasicAWSCredentials("",""
+      );
+      AmazonS3 s3client = AmazonS3ClientBuilder
+        .standard()
+        .withCredentials(new AWSStaticCredentialsProvider(credentials))
+        .withRegion(Regions.AP_SOUTHEAST_1)
+        .build();
+
+      BASE64Decoder decoder = new BASE64Decoder();
+      byte[] imageByte = decoder.decodeBuffer(context.getBodyAsJson().getString("base64encodedImage"));
+      InputStream targetStream = new ByteArrayInputStream(imageByte);
+
+
+      ObjectMetadata meta = new ObjectMetadata();
+      meta.setContentLength(imageByte.length);
+      meta.setContentType("image/png");
+
+      String fileName = "imageNumber-"+ Instant.now().toEpochMilli()+".png";;
+
+      s3client.putObject(new PutObjectRequest(
+        bucketName, fileName, targetStream, meta)
+        .withCannedAcl(CannedAccessControlList.Private));
+
+      context.response().setStatusCode(200);
+      context.response().end(new JsonObject().put("imageUrl",
+        "https://s3-dragon.s3-ap-southeast-1.amazonaws.com/"+fileName).encodePrettily());
+    }
+    catch (Exception e)
+    {
+      LOGGER.error("failure to upload to S3 " +e);
+      context.response().setStatusCode(500);
+      context.response().end(new JsonObject()
+        .put("success", false)
+        .put("error", e.getMessage()).encodePrettily());
+    }
   }
 
   private void apiGetWiki(RoutingContext context)
@@ -319,7 +398,7 @@ public class HttpServerVerticle extends AbstractVerticle implements DatabaseCons
       LOGGER.error("LAT is " + latitude);
       Double longitude = data.getDouble("longitude");
       Double radiusFromEpicenter = data.getDouble("radiusFromEpicenterinMeter");
-      Double radiusFromEpicenterInKm = radiusFromEpicenter == null  ? .5D : radiusFromEpicenter/1000;
+      Double radiusFromEpicenterInKm = radiusFromEpicenter == null  ? 500000D : radiusFromEpicenter/1000;
       LOGGER.error("radius from epi in KM " +radiusFromEpicenterInKm);
       LOGGER.error("LAT is " + latitude);
       LOGGER.error("Lon is " + longitude);
@@ -443,10 +522,11 @@ public class HttpServerVerticle extends AbstractVerticle implements DatabaseCons
     try{
       JsonObject data = context.getBodyAsJson();
 
-      if(!validateCreateWiki(context))
+      /*if(!validateCreateWiki(context))
       {
+        LOGGER.error("returning");
         return;
-      }
+      }*/
 
       mongoClient.save("wiki", data, ar -> {
         if(ar.succeeded())
@@ -583,6 +663,7 @@ public class HttpServerVerticle extends AbstractVerticle implements DatabaseCons
 
   private boolean validateCreateWiki(RoutingContext context)
   {
+    LOGGER.error("REACHED HERE");
 
     JsonObject requestBody = context.getBodyAsJson();
     if(!requestBody.containsKey("name") || StringUtil.isEmpty(requestBody.getString("name")) )
